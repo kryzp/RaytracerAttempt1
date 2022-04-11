@@ -1,0 +1,327 @@
+
+/*
+Note:
+ any weird magic numbers like apart from the C_ constants are likely just random numbers to emulate randomness i pick by violently punching the keyboard
+ beating it into submission, forcing it to give me a random number
+
+ i think.
+*/
+
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D o_target;
+layout(rgba32f, binding = 1) uniform readonly image2D u_skybox_texture;
+
+uniform mat4 u_view_matrix;
+uniform mat4 u_inverse_projection;
+uniform float u_time = 0.0;
+
+const float C_INFINITY = 1.0 / 0.0;
+const float C_PI = 3.14159265359;
+const float C_TAU = 6.28318530718;
+const float C_DEG2RAD = 0.01745329251;
+const float C_RAD2DEG = 57.2957795131;
+const int C_LIGHT_BOUNCES = 32;
+const int C_AA_SAMPLES = 16;
+const int C_RAYS_PER_PIXEL = 64;
+const vec2 C_INV_ATAN = vec2(0.1591, 0.3183);
+
+struct Sphere
+{
+    vec3 position;
+    float radius;
+    vec3 albedo;
+    vec3 specular;
+    vec3 emission;
+};
+
+struct Ray
+{
+    vec3 origin;
+    vec3 direction;
+    vec3 energy;
+};
+
+struct RayHit
+{
+    float t;
+    vec3 position;
+    vec3 normal;
+    vec3 albedo;
+    vec3 specular;
+    vec3 emission;
+};
+
+float length_squared(vec3 v)
+{
+    return
+        (v.x * v.x) +
+        (v.y * v.y) +
+        (v.z * v.z);
+}
+
+float rand(float seed)
+{
+    return fract(sin((u_time * 10.5) + seed / C_PI * dot(gl_GlobalInvocationID.xy, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+vec3 random_in_unit_sphere(float seed)
+{
+    vec3 v = vec3(0.0);
+
+    do
+    {
+        v.x = rand(seed + 9.2261)*2.0 - 1.0;
+        v.y = rand(seed + 5.5632)*2.0 - 1.0;
+        v.z = rand(seed + 1.3613)*2.0 - 1.0;
+    }
+    while(length_squared(v) > 1.0);
+
+    return v;
+}
+
+mat3 get_tangent_space(vec3 normal)
+{
+    vec3 helper = vec3(1, 0, 0);
+
+    if (abs(normal.x) > 0.99f)
+        helper = vec3(0, 0, 1);
+
+    vec3 tangent = normalize(cross(normal, helper));
+    vec3 binormal = normalize(cross(normal, tangent));
+
+    return mat3(tangent, binormal, normal);
+}
+
+vec3 random_in_unit_hemisphere(vec3 normal, float seed)
+{
+    vec3 v = random_in_unit_sphere(seed);
+
+    if (dot(v, normal) < 0)
+        return -v;
+
+    return v;
+}
+
+Sphere create_sphere(vec3 position, float radius, vec3 albedo, vec3 specular, vec3 emission)
+{
+    Sphere sphere;
+    sphere.position = position;
+    sphere.radius = radius;
+    sphere.albedo = albedo;
+    sphere.specular = specular;
+    sphere.emission = emission;
+
+    return sphere;
+}
+
+Ray create_camera_ray(vec2 uv)
+{
+    vec3 origin = (u_view_matrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+
+    vec3 direction = (u_inverse_projection * vec4(uv, 0.0, 1.0)).xyz;
+    direction = (u_view_matrix * vec4(direction, 0.0)).xyz;
+
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = vec3(1.0);
+
+    return ray;
+}
+
+RayHit create_empty_ray_hit()
+{
+    RayHit hit;
+    hit.t = C_INFINITY;
+    hit.position = vec3(0.0);
+    hit.normal = vec3(0.0);
+    hit.albedo = vec3(0.0);
+    hit.specular = vec3(0.0);
+    hit.emission = vec3(0.0);
+
+    return hit;
+}
+
+vec3 ray_at(Ray ray, float t)
+{
+    return ray.origin + ray.direction*t;
+}
+
+//https://dsp.stackexchange.com/questions/25770/looking-for-an-arcsin-algorithm
+
+float approx_arcsin(float x)
+{
+    return x * (1.0 + (x * x * (0.16666666667 + (x * x * (0.075 + (x * x * 0.044642857))))));
+}
+
+// note: approximate arctan(x) = pi / 4 * x;
+
+vec3 background(Ray ray)
+{
+    // works, unfortunately turns framerate into just frame
+    // i think using polynomial approximations of the arc- functions could speed it up
+
+    vec2 size_skybox = imageSize(u_skybox_texture).xy;
+
+    vec2 spherical_coordinates = vec2(
+        atan(ray.direction.z, ray.direction.x),
+        approx_arcsin(ray.direction.y)//asin(ray.direction.y)
+    );
+
+    spherical_coordinates *= C_INV_ATAN;
+    spherical_coordinates += 0.5;
+    spherical_coordinates *= size_skybox;
+
+    return imageLoad(u_skybox_texture, ivec2(spherical_coordinates.xy)).rgb;
+
+    //return vec3(0.1);
+}
+
+void intersect_sphere(Ray ray, Sphere sphere, inout RayHit best_hit)
+{
+    vec3 sphere_to_origin = ray.origin - sphere.position;
+    float a = length_squared(ray.direction);
+    float half_b = dot(sphere_to_origin, ray.direction);
+    float c = length_squared(sphere_to_origin) - sphere.radius*sphere.radius;
+    float discriminant = half_b*half_b - a*c;
+
+    // discriminant < 0 :: no real solutions
+    // discriminant = 0 :: 1 real solution
+    // discriminant > 0 :: 2 real solutions
+
+    if (discriminant >= 0)
+    {
+        float t = (-half_b - sqrt(discriminant)) / a; // solve via quadratic formula
+
+        if (t > 0.001 && t < best_hit.t)
+        {
+            vec3 n = normalize(ray_at(ray, t) - sphere.position);
+
+            best_hit.t = t;
+            best_hit.position = ray_at(ray, t);
+            best_hit.normal = n;
+            best_hit.albedo = sphere.albedo;
+            best_hit.specular = sphere.specular;
+            best_hit.emission = sphere.emission;
+        }
+    }
+}
+
+RayHit follow_ray(Ray ray)
+{
+    RayHit best_hit = create_empty_ray_hit();
+
+    //                        position                  rad   albedo                  specular   emission
+    Sphere s1 = create_sphere(vec3( 00.0, -15.5, -1.0), 15.0, vec3(0.10, 0.20, 0.35), vec3(0.0), vec3(0.0, 0.0, 0.0));
+    Sphere s2 = create_sphere(vec3( 00.0,  00.0, -1.0), 0.50, vec3(1.00, 1.00, 1.00), vec3(0.0), vec3(1.0, 5.0, 1.00) * 1.5);
+    Sphere s3 = create_sphere(vec3(-01.0,  00.0, -2.0), 0.50, vec3(0.15, 0.75, 0.80), vec3(1.0), vec3(0.0, 0.0, 0.0));
+    Sphere s4 = create_sphere(vec3(-02.0,  00.1, -2.0), 0.15, vec3(0.15, 0.75, 0.80), vec3(0.0), vec3(27.5, 1.0, 2.5) * 3.0);
+    Sphere s5 = create_sphere(vec3( 01.0,  00.0, -2.0), 0.50, vec3(0.15, 0.75, 0.80), vec3(1.0), vec3(0.0, 0.0, 0.0));
+    Sphere s6 = create_sphere(vec3(-01.0,  00.9, -2.0), 0.40, vec3(0.15, 0.75, 0.80), vec3(1.0), vec3(0.0, 0.0, 0.0));
+
+    intersect_sphere(ray, s1, best_hit);
+    intersect_sphere(ray, s2, best_hit);
+    intersect_sphere(ray, s3, best_hit);
+    intersect_sphere(ray, s4, best_hit);
+    intersect_sphere(ray, s5, best_hit);
+    intersect_sphere(ray, s6, best_hit);
+
+    return best_hit;
+}
+
+float energy_probability(vec3 energy)
+{
+    return dot(energy, vec3(1.0 / 10.0));
+}
+
+vec3 trace(inout Ray ray, RayHit hit, int sample_index, int light_bounce)
+{
+    if (hit.t < C_INFINITY)
+    {
+        hit.albedo = min(1.0f - hit.specular, hit.albedo);
+
+        ray.origin = hit.position + (hit.normal * 0.001);
+
+        float p_specular = energy_probability(hit.specular);
+        float p_albedo = energy_probability(hit.albedo);
+
+        float roulette = rand(sample_index*6.25 + light_bounce*9.1);
+
+        if (roulette < p_specular)
+        {
+            ray.direction = reflect(ray.direction, hit.normal);
+            ray.energy *= (1.0 / p_specular) * hit.specular * dot(hit.normal, ray.direction);
+        }
+        else if (p_albedo > 0.0 && roulette < p_specular + p_albedo)
+        {
+            ray.direction = random_in_unit_hemisphere(hit.normal, length_squared(hit.position) + sample_index*5.87 + light_bounce*1.2);
+            ray.energy *= (1.0 / p_albedo) * hit.albedo;
+        }
+        else
+        {
+            ray.energy *= 0.0;
+        }
+
+        return hit.emission;
+    }
+    else
+    {
+        // background -- all energy is absorbed
+        ray.energy *= 0.0;
+        return background(ray);
+    }
+}
+
+vec3 trace_sample(inout Ray ray, int sample_index)
+{
+    vec3 sample_sum = vec3(0.0);
+
+    for (int j = 1; j <= C_LIGHT_BOUNCES; j++)
+    {
+        RayHit hit = follow_ray(ray);
+
+        vec3 energy = ray.energy;
+        vec3 emission = trace(ray, hit, sample_index, j);
+
+        sample_sum += energy * emission;
+
+        if (ray.energy == vec3(0.0))
+            break;
+    }
+
+    return sample_sum;
+}
+
+void main()
+{
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    vec2 coordsf = vec2(gl_GlobalInvocationID.xy);
+    vec2 size = vec2(imageSize(o_target).xy);
+
+    vec3 result = vec3(0.0);
+
+    for (int i = 1; i <= C_AA_SAMPLES; i++)
+    {
+        float yes = float(i) - (float(C_AA_SAMPLES) / 2.0);
+
+        float r1 = rand(size.x + i) * 1.5;
+        float r2 = rand(i + size.y) * 1.5;
+
+        vec2 offset = vec2(r1, r2);
+        vec2 uv = vec2((((coordsf + offset + vec2(0.5, 0.5)) / size) * 2.0) - 1.0);
+
+        Ray camera_ray = create_camera_ray(uv);
+
+        for (int curr_ray = 1; curr_ray <= C_RAYS_PER_PIXEL; curr_ray++)
+        {
+            Ray ray = camera_ray;
+            result += trace_sample(ray, curr_ray);
+        }
+    }
+
+    result /= float(C_RAYS_PER_PIXEL) * float(C_AA_SAMPLES);
+
+    imageStore(o_target, coords, vec4(result, 1.0));
+}
